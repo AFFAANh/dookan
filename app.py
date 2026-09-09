@@ -36,13 +36,32 @@ def database_is_busy(exc):
 @app.post("/crates")
 def create_crate():
     data = request.get_json()
-    c = conn()
-    cur = c.execute(
-        "INSERT INTO crates (code, size, state, deposit) VALUES (?, ?, ?, ?)",
-        (data["code"], data["size"], "in_yard", data.get("deposit", 50.0)),
-    )
-    c.commit()
-    return jsonify({"id": cur.lastrowid}), 201
+    with closing(conn()) as c:
+        try:
+            with c:
+                c.execute("BEGIN IMMEDIATE")
+                # Old deletions may have left history whose crate ID must stay reserved.
+                highest = c.execute(
+                    "SELECT MAX(id) AS highest FROM ("
+                    "SELECT 0 AS id UNION ALL SELECT id FROM crates "
+                    "UNION ALL SELECT crate_id FROM movements "
+                    "WHERE typeof(crate_id) = 'integer')"
+                ).fetchone()["highest"]
+                if highest == 2**63 - 1:
+                    return jsonify({
+                        "error": "No higher crate ID is available; manual reconciliation is required",
+                        "code": "id_space_exhausted",
+                    }), 409
+                crate_id = highest + 1
+                c.execute(
+                    "INSERT INTO crates (id, code, size, state, deposit) VALUES (?, ?, ?, ?, ?)",
+                    (crate_id, data["code"], data["size"], "in_yard", data.get("deposit", 50.0)),
+                )
+        except sqlite3.OperationalError as exc:
+            if database_is_busy(exc):
+                return jsonify({"error": "Database is busy; retry crate creation"}), 503
+            raise
+    return jsonify({"id": crate_id}), 201
 
 
 @app.get("/crates")
@@ -118,10 +137,16 @@ def update_crate(crate_id):
 
 @app.delete("/crates/<int:crate_id>")
 def delete_crate(crate_id):
-    c = conn()
-    c.execute("DELETE FROM crates WHERE id = ?", (crate_id,))
-    c.commit()
-    return jsonify({"ok": True})
+    if not 0 < crate_id <= 2**63 - 1:
+        return jsonify({"error": "Crate not found"}), 404
+    with closing(conn()) as c:
+        crate = c.execute("SELECT id FROM crates WHERE id = ?", (crate_id,)).fetchone()
+    if crate is None:
+        return jsonify({"error": "Crate not found"}), 404
+    return jsonify({
+        "error": "Crate records cannot be deleted; use PATCH with state=retired to retire a yard crate",
+        "code": "retirement_required",
+    }), 409
 
 
 @app.get("/crates/<int:crate_id>/history")

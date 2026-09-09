@@ -69,8 +69,8 @@ claim, repair history automatically, or rebuild the database. The unchanged
 `seed.py` remains a destructive demo-data generator, not a repair command.
 
 Fix 1 covers the two movement endpoints. Fix 2 below protects filtering and
-PATCH, including retirement. DELETE/identity loss remains pending as fix 3
-from `FINDINGS.md`; the deposit endpoint is a later feature.
+PATCH, including retirement. Fix 3 preserves crate records and reserves IDs
+referenced by history. The deposit endpoint is a later feature.
 
 ## Crate filtering and updates (fix 2)
 
@@ -113,7 +113,33 @@ Metadata edits may accompany retirement and are committed together or rolled
 back together. Successful PATCH returns `200` with `{"ok": true}`, missing
 crates return `404`, and database lock contention returns `503`. Retirement
 changes the stored state; a separate retirement audit event is still a deferred
-audit improvement. This fix does not change crate creation or DELETE behavior.
+audit improvement.
+
+## Preserve crate identities (fix 3)
+
+`DELETE /crates/<id>` returns `409` with `"code": "retirement_required"` for
+every existing crate, including yard stock and retired crates. It changes
+neither the crate nor its history. Missing or out-of-range IDs return `404`.
+To remove a crate from service, use the guarded PATCH retirement shown above;
+DELETE does not implicitly retire it. Even an unused crate keeps its record
+so its identity cannot be reassigned through the API.
+
+Creation returns `201` with the new ID as before. A new ID is allocated above
+both the existing crate IDs and all integer crate references in movement
+history, including orphaned history from earlier deletions. Allocation and
+insertion hold one SQLite write lock so concurrent creates receive different
+IDs. For example, if the highest crate ID is 3 but history references deleted
+crate 9, the next crate receives ID 10, with no inherited movements.
+
+If the highest reserved ID is SQLite's signed 64-bit maximum, creation returns
+`409` with `"code": "id_space_exhausted"` rather than reusing a lower ID.
+Database lock contention returns `503`; a failed insert rolls back. No schema
+migration is required.
+
+These changes preserve future API records and avoid reconnecting orphaned
+history. They cannot reconstruct already-deleted crates, repair histories
+already attached to reused IDs, or discover old IDs without surviving records.
+Historical reconciliation and database constraints remain deferred findings.
 
 ## Tests
 
