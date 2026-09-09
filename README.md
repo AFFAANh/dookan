@@ -25,6 +25,7 @@ GET    /crates/<id>/history
 
 POST   /riders
 GET    /riders
+GET    /riders/deposits
 GET    /riders/<id>
 
 POST   /movements/issue     {"crate_id": 1, "rider_id": 4}
@@ -70,7 +71,7 @@ claim, repair history automatically, or rebuild the database. The unchanged
 
 Fix 1 covers the two movement endpoints. Fix 2 below protects filtering and
 PATCH, including retirement. Fix 3 preserves crate records and reserves IDs
-referenced by history. The deposit endpoint is a later feature.
+referenced by history. The deposit report below uses these custody rules.
 
 ## Crate filtering and updates (fix 2)
 
@@ -140,6 +141,62 @@ These changes preserve future API records and avoid reconnecting orphaned
 history. They cannot reconstruct already-deleted crates, repair histories
 already attached to reused IDs, or discover old IDs without surviving records.
 Historical reconciliation and database constraints remain deferred findings.
+
+## Outstanding deposits (Part C)
+
+`GET /riders/deposits` returns every rider in ID order, including riders holding
+zero crates. Amounts are integer rupees: each currently held crate contributes
+₹50. The report uses validated current custody, not total issues minus returns
+or the legacy, editable-on-creation `deposit` column. It does not track payments
+collected or refunds paid.
+
+For example, with two crates held by rider 1 and none by rider 2:
+
+```json
+{
+  "currency": "INR",
+  "deposit_per_crate_inr": 50,
+  "complete": true,
+  "riders": [
+    {"rider_id": 1, "name": "Rider A", "verified_crates_held": 2, "verified_deposit_inr": 100, "outstanding_deposit_inr": 100},
+    {"rider_id": 2, "name": "Rider B", "verified_crates_held": 0, "verified_deposit_inr": 0, "outstanding_deposit_inr": 0}
+  ],
+  "reconciliation": {"crate_ids": [], "orphan_movement_ids": []}
+}
+```
+
+Issue increases the current holder's amount by ₹50; return removes it. Reissue
+assigns the amount to the new holder. Yard and consistently retired crates
+contribute nothing. Completed trips do not accumulate extra liability.
+
+The endpoint reads riders, crates, and movements with three queries inside one
+read transaction, so concurrent writes cannot mix old state with new history.
+It makes no changes and uses the same history validation as issue/return.
+Completeness describes consistency of recorded custody, not independently
+verified physical stock or payment receipts.
+
+If any crate's history/state or physical label is unresolved, `complete` is
+`false`. All `outstanding_deposit_inr` values become `null`, because unresolved
+custody can affect any rider. `verified_crates_held` and `verified_deposit_inr`
+remain available as partial results; they are not final balances to collect.
+Crates with duplicate labels are all excluded from those verified subtotals,
+even when one duplicate is in the yard or retired. Label comparison trims outer
+whitespace; blank/non-string labels are also excluded. The stored labels are
+never changed by the report.
+
+`reconciliation.crate_ids` lists affected crates, and
+`reconciliation.orphan_movement_ids` lists movements referencing missing crates.
+The supplied corrupt seed therefore returns an incomplete report with these
+IDs, without silently repairing data or assigning the latest claimant.
+Successful reports, including incomplete ones, return `200`; a database lock
+failure returns `503`. The older `GET /riders` event-balance calculation remains
+unchanged; use this report for deposit totals only when `complete` is `true`.
+
+To inspect it in PowerShell while the app is running:
+
+```powershell
+Invoke-RestMethod 'http://localhost:5000/riders/deposits' | ConvertTo-Json -Depth 6
+```
 
 ## Tests
 

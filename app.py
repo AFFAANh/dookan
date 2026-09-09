@@ -6,12 +6,14 @@ for a few weeks.
 """
 
 import sqlite3
+from collections import Counter, defaultdict
 from contextlib import closing
 from datetime import datetime
 
 from flask import Flask, jsonify, request
 
 DB = "crates.db"
+DEPOSIT_PER_CRATE_INR = 50
 
 app = Flask(__name__)
 
@@ -205,6 +207,74 @@ def get_rider(rider_id):
     )
 
 
+@app.get("/riders/deposits")
+def rider_deposits():
+    with closing(conn()) as c:
+        try:
+            with c:
+                # One read snapshot keeps rider, crate and history data consistent.
+                c.execute("BEGIN")
+                riders = c.execute("SELECT id, name FROM riders ORDER BY id").fetchall()
+                crates = c.execute("SELECT id, code, state FROM crates ORDER BY id").fetchall()
+                movements = c.execute(
+                    "SELECT m.*, r.id AS known_rider FROM movements m "
+                    "LEFT JOIN riders r ON r.id = m.rider_id ORDER BY m.id"
+                ).fetchall()
+                at = datetime.now().replace(microsecond=0)
+        except sqlite3.OperationalError as exc:
+            if database_is_busy(exc):
+                return jsonify({"error": "Database is busy; retry the deposit report"}), 503
+            raise
+
+    crate_ids = {crate["id"] for crate in crates}
+    histories = defaultdict(list)
+    orphan_movement_ids = []
+    for movement in movements:
+        if movement["crate_id"] not in crate_ids:
+            orphan_movement_ids.append(movement["id"])
+        else:
+            histories[movement["crate_id"]].append(movement)
+
+    # A duplicated physical label cannot establish separate, billable crates.
+    codes = Counter(
+        crate["code"].strip() for crate in crates if isinstance(crate["code"], str)
+    )
+    counts = {rider["id"]: 0 for rider in riders}
+    invalid_crate_ids = []
+    for crate in crates:
+        code = crate["code"]
+        if not isinstance(code, str) or not code.strip() or codes[code.strip()] != 1:
+            invalid_crate_ids.append(crate["id"])
+            continue
+        try:
+            holder = holder_from_history(crate, histories[crate["id"]], at)
+        except CustodyConflict:
+            invalid_crate_ids.append(crate["id"])
+            continue
+        if holder is not None:
+            counts[holder] += 1
+
+    complete = not (invalid_crate_ids or orphan_movement_ids)
+    return jsonify({
+        "currency": "INR",
+        "deposit_per_crate_inr": DEPOSIT_PER_CRATE_INR,
+        "complete": complete,
+        "riders": [{
+            "rider_id": rider["id"],
+            "name": rider["name"],
+            "verified_crates_held": counts[rider["id"]],
+            "verified_deposit_inr": counts[rider["id"]] * DEPOSIT_PER_CRATE_INR,
+            "outstanding_deposit_inr": (
+                counts[rider["id"]] * DEPOSIT_PER_CRATE_INR if complete else None
+            ),
+        } for rider in riders],
+        "reconciliation": {
+            "crate_ids": invalid_crate_ids,
+            "orphan_movement_ids": orphan_movement_ids,
+        },
+    })
+
+
 # ------------------------------------------------------------- movements
 
 
@@ -214,15 +284,19 @@ class CustodyConflict(ValueError):
 
 def current_holder(c, crate, at):
     """Replay a complete, consistent history; never choose the latest claim."""
-    if crate["state"] not in ("in_yard", "with_rider", "retired"):
-        raise CustodyConflict
-
     movements = c.execute(
         "SELECT m.kind, m.rider_id, m.at, r.id AS known_rider "
         "FROM movements m LEFT JOIN riders r ON r.id = m.rider_id "
         "WHERE m.crate_id = ? ORDER BY m.id",
         (crate["id"],),
     ).fetchall()
+    return holder_from_history(crate, movements, at)
+
+
+def holder_from_history(crate, movements, at):
+    """Validate the same custody rules for a single crate or a batched report."""
+    if crate["state"] not in ("in_yard", "with_rider", "retired"):
+        raise CustodyConflict
     holder = None
     previous_at = None
     for movement in movements:

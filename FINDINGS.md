@@ -1,6 +1,6 @@
 # Findings — Part A
 
-Reviewed every supplied file: `app.py`, `seed.py`, `README.md`, and `requirements.txt`. Ranked by damage to custody and recoverability, then operational impact. Findings 1–3 are the proposed three fix scopes; this commit changes no application code. Line references refer to the original starter.
+Reviewed every supplied file: `app.py`, `seed.py`, `README.md`, and `requirements.txt`. Ranked by damage to custody and recoverability, then operational impact. Findings 1–3 were selected for the three fixes. This review describes the original starter; line references use that version.
 
 1. **Movements do not enforce custody** (`app.py:134–167`). Two issues for one crate both return 201 and record different riders as holding it. Wrong-rider returns make it yard stock and produce negative holdings; repeated returns, retired-crate movements, and nonexistent IDs also succeed. Existing writes share a transaction, but state, ownership, and concurrency guards are absent.
 
@@ -30,4 +30,4 @@ Assume retirement requires a crate in the yard and is terminal. Outstanding depo
 
 Verified failures using Flask's test client and disposable SQLite databases outside the repo; also ran the unmodified seeder against a temporary database. No operational database was touched.
 
-Time spent: estimated at 60–90 minutes for Part A, including setup, code review, failure reproduction, prioritization, and documentation.
+Time spent: estimated at 6–8.5 hours for Parts A–C (review, three fixes, feature, tests, and documentation); walkthrough preparation is pending.
