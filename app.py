@@ -6,6 +6,7 @@ for a few weeks.
 """
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime
 
 from flask import Flask, jsonify, request
@@ -131,40 +132,121 @@ def get_rider(rider_id):
 # ------------------------------------------------------------- movements
 
 
+class CustodyConflict(ValueError):
+    """The recorded state and history cannot establish one current holder."""
+
+
+def current_holder(c, crate, at):
+    """Replay a complete, consistent history; never choose the latest claim."""
+    if crate["state"] not in ("in_yard", "with_rider", "retired"):
+        raise CustodyConflict
+
+    movements = c.execute(
+        "SELECT m.kind, m.rider_id, m.at, r.id AS known_rider "
+        "FROM movements m LEFT JOIN riders r ON r.id = m.rider_id "
+        "WHERE m.crate_id = ? ORDER BY m.id",
+        (crate["id"],),
+    ).fetchall()
+    holder = None
+    previous_at = None
+    for movement in movements:
+        try:
+            recorded_at = datetime.strptime(movement["at"], "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            raise CustodyConflict from None
+        if (
+            recorded_at.strftime("%Y-%m-%d %H:%M:%S") != movement["at"]
+            or recorded_at > at
+            or (previous_at is not None and recorded_at < previous_at)
+            or movement["known_rider"] is None
+        ):
+            raise CustodyConflict
+        previous_at = recorded_at
+
+        if movement["kind"] == "issue" and holder is None:
+            holder = movement["rider_id"]
+        elif movement["kind"] == "return" and holder == movement["rider_id"]:
+            holder = None
+        else:
+            raise CustodyConflict
+
+    expected_state = "with_rider" if holder is not None else "in_yard"
+    if crate["state"] != expected_state and not (
+        crate["state"] == "retired" and holder is None
+    ):
+        raise CustodyConflict
+    return holder
+
+
+def record_movement(kind):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or any(
+        type(data.get(field)) is not int or not 0 < data[field] <= 2**63 - 1
+        for field in ("crate_id", "rider_id")
+    ):
+        return jsonify({"error": "crate_id and rider_id must be positive integers"}), 400
+
+    with closing(conn()) as c:
+        try:
+            with c:
+                # Lock before reading: competing writers must check the committed result.
+                c.execute("BEGIN IMMEDIATE")
+                crate = c.execute(
+                    "SELECT * FROM crates WHERE id = ?", (data["crate_id"],)
+                ).fetchone()
+                if crate is None:
+                    return jsonify({"error": "Crate not found"}), 404
+                rider = c.execute(
+                    "SELECT id FROM riders WHERE id = ?", (data["rider_id"],)
+                ).fetchone()
+                if rider is None:
+                    return jsonify({"error": "Rider not found"}), 404
+
+                # Sample time after obtaining the lock, so queued writes stay ordered.
+                at = datetime.now().replace(microsecond=0)
+                try:
+                    holder = current_holder(c, crate, at)
+                except CustodyConflict:
+                    return jsonify({
+                        "error": "Crate state or history needs reconciliation before movement",
+                        "code": "reconciliation_required",
+                    }), 409
+
+                if kind == "issue":
+                    if crate["state"] != "in_yard":
+                        return jsonify({"error": "Only a crate in the yard can be issued"}), 409
+                    state = "with_rider"
+                else:
+                    if crate["state"] != "with_rider" or holder != data["rider_id"]:
+                        return jsonify({"error": "Only the current holder can return this crate"}), 409
+                    state = "in_yard"
+
+                c.execute(
+                    "INSERT INTO movements (crate_id, rider_id, kind, at) VALUES (?, ?, ?, ?)",
+                    (data["crate_id"], data["rider_id"], kind, at.strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                c.execute(
+                    "UPDATE crates SET state = ? WHERE id = ?", (state, data["crate_id"])
+                )
+        except sqlite3.OperationalError as exc:
+            # Python before 3.11 exposes the SQLite message but not its error name.
+            error_name = getattr(exc, "sqlite_errorname", "")
+            if error_name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED")) or str(exc) in (
+                "database is locked", "database table is locked", "database schema is locked"
+            ):
+                return jsonify({"error": "Database is busy; retry the movement"}), 503
+            raise
+    return jsonify({"ok": True}), 201
+
+
 @app.post("/movements/issue")
 def issue_crate():
-    data = request.get_json()
-    c = conn()
-    c.execute(
-        "INSERT INTO movements (crate_id, rider_id, kind, at) VALUES (?, ?, 'issue', ?)",
-        (
-            data["crate_id"],
-            data["rider_id"],
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ),
-    )
-    c.execute(
-        "UPDATE crates SET state = 'with_rider' WHERE id = ?", (data["crate_id"],)
-    )
-    c.commit()
-    return jsonify({"ok": True}), 201
+    return record_movement("issue")
 
 
 @app.post("/movements/return")
 def return_crate():
-    data = request.get_json()
-    c = conn()
-    c.execute(
-        "INSERT INTO movements (crate_id, rider_id, kind, at) VALUES (?, ?, 'return', ?)",
-        (
-            data["crate_id"],
-            data["rider_id"],
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ),
-    )
-    c.execute("UPDATE crates SET state = 'in_yard' WHERE id = ?", (data["crate_id"],))
-    c.commit()
-    return jsonify({"ok": True}), 201
+    return record_movement("return")
 
 
 if __name__ == "__main__":
