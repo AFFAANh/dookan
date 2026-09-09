@@ -22,6 +22,14 @@ def conn():
     return c
 
 
+def database_is_busy(exc):
+    # Python before 3.11 exposes the SQLite message but not its error name.
+    error_name = getattr(exc, "sqlite_errorname", "")
+    return error_name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED")) or str(exc) in (
+        "database is locked", "database table is locked", "database schema is locked"
+    )
+
+
 # ---------------------------------------------------------------- crates
 
 
@@ -40,11 +48,15 @@ def create_crate():
 @app.get("/crates")
 def list_crates():
     state = request.args.get("state")
-    c = conn()
+    if state is not None and state not in ("in_yard", "with_rider", "retired"):
+        return jsonify({"error": "state must be in_yard, with_rider, or retired"}), 400
     q = "SELECT * FROM crates"
-    if state:
-        q += " WHERE state = '%s'" % state
-    rows = c.execute(q).fetchall()
+    parameters = ()
+    if state is not None:
+        q += " WHERE state = ?"
+        parameters = (state,)
+    with closing(conn()) as c:
+        rows = c.execute(q, parameters).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -57,11 +69,50 @@ def get_crate(crate_id):
 
 @app.patch("/crates/<int:crate_id>")
 def update_crate(crate_id):
-    data = request.get_json()
-    c = conn()
-    for field, value in data.items():
-        c.execute("UPDATE crates SET %s = ? WHERE id = ?" % field, (value, crate_id))
-    c.commit()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data:
+        return jsonify({"error": "A nonempty JSON object is required"}), 400
+    if set(data) - {"code", "size", "state"}:
+        return jsonify({"error": "Only code, size, and guarded retirement are editable"}), 400
+    if "code" in data and (not isinstance(data["code"], str) or not data["code"].strip()):
+        return jsonify({"error": "code must be a nonblank string"}), 400
+    if "size" in data and data["size"] not in ("small", "medium", "large"):
+        return jsonify({"error": "size must be small, medium, or large"}), 400
+    if "state" in data and data["state"] != "retired":
+        return jsonify({"error": "state can only be set to retired; use issue/return for custody"}), 400
+    if not 0 < crate_id <= 2**63 - 1:
+        return jsonify({"error": "Crate not found"}), 404
+
+    with closing(conn()) as c:
+        try:
+            with c:
+                c.execute("BEGIN IMMEDIATE")
+                crate = c.execute(
+                    "SELECT * FROM crates WHERE id = ?", (crate_id,)
+                ).fetchone()
+                if crate is None:
+                    return jsonify({"error": "Crate not found"}), 404
+                if "state" in data:
+                    try:
+                        current_holder(c, crate, datetime.now().replace(microsecond=0))
+                    except CustodyConflict:
+                        return jsonify({
+                            "error": "Crate state or history needs reconciliation before retirement",
+                            "code": "reconciliation_required",
+                        }), 409
+                    if crate["state"] not in ("in_yard", "retired"):
+                        return jsonify({"error": "Only a crate in the yard can be retired"}), 409
+
+                # Column names are fixed; every client-supplied value is a parameter.
+                c.execute(
+                    "UPDATE crates SET code = ?, size = ?, state = ? WHERE id = ?",
+                    (data.get("code", crate["code"]), data.get("size", crate["size"]),
+                     data.get("state", crate["state"]), crate_id),
+                )
+        except sqlite3.OperationalError as exc:
+            if database_is_busy(exc):
+                return jsonify({"error": "Database is busy; retry the update"}), 503
+            raise
     return jsonify({"ok": True})
 
 
@@ -229,11 +280,7 @@ def record_movement(kind):
                     "UPDATE crates SET state = ? WHERE id = ?", (state, data["crate_id"])
                 )
         except sqlite3.OperationalError as exc:
-            # Python before 3.11 exposes the SQLite message but not its error name.
-            error_name = getattr(exc, "sqlite_errorname", "")
-            if error_name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED")) or str(exc) in (
-                "database is locked", "database table is locked", "database schema is locked"
-            ):
+            if database_is_busy(exc):
                 return jsonify({"error": "Database is busy; retry the movement"}), 503
             raise
     return jsonify({"ok": True}), 201
